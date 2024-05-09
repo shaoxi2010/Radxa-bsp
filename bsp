@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+if [ "x$(uname)" == "xDarwin" ]; then
+	GETOPT=$(brew --prefix gnu-getopt)/bin/getopt
+else
+	GETOPT=getopt
+fi
+
 main() {
     local SCRIPT_DIR="$(dirname "$(realpath "$0")")"
     source "$SCRIPT_DIR/lib/utils.sh"
@@ -10,7 +16,7 @@ main() {
     rm -f "$SCRIPT_DIR/.src/build.log"
 
     local ARGV=("$@") TEMP
-    if ! TEMP="$(getopt -o "r:cCphnlsdb:" -l "revision:,clean,distclean,no-prepare-source,no-config,help,native-build,local-container,container-shell,debug,dtb,long-version,backend:,no-submodule-check,dirty,no-build,no-container-update" -n "$0" -- "$@")"
+    if ! TEMP="$($GETOPT -o "r:cCphnlsdb:" -l "revision:,clean,distclean,no-prepare-source,no-config,help,native-build,local-container,container-shell,debug,dtb,long-version,backend:,no-submodule-check,dirty,no-build,no-container-update" -n "$0" -- "$@")"
     then
         return
     fi
