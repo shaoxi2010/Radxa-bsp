@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bsp <bsp@radxa.com>
+Date: Fri, 10 May 2024 19:22:55 +0800
+Subject: [PATCH] add ili9488 driver
+
+---
+ drivers/gpu/drm/tiny/Kconfig   |  13 ++
+ drivers/gpu/drm/tiny/Makefile  |   1 +
+ drivers/gpu/drm/tiny/ili9488.c | 239 +++++++++++++++++++++++++++++++++
+ 3 files changed, 253 insertions(+)
+ create mode 100644 drivers/gpu/drm/tiny/ili9488.c
+
+diff --git a/drivers/gpu/drm/tiny/Kconfig b/drivers/gpu/drm/tiny/Kconfig
+index 61053d580..792d47e9f 100644
+--- a/drivers/gpu/drm/tiny/Kconfig
++++ b/drivers/gpu/drm/tiny/Kconfig
+@@ -80,6 +80,19 @@ config TINYDRM_ILI9486
+ 
+ 	  If M is selected the module will be called ili9486.
+ 
++config TINYDRM_ILI9488
++	tristate "DRM support for ILI9488 display panels"
++	depends on DRM && SPI
++	select DRM_KMS_HELPER
++	select DRM_KMS_CMA_HELPER
++	select DRM_MIPI_DBI
++	select BACKLIGHT_CLASS_DEVICE
++	help
++	  DRM driver for the following Ilitek ILI9488 panels:
++	  * RPILCD 3.5" 320x480 TFT (Walntupi 3.5")
++
++	  If M is selected the module will be called ili9488.
++
+ config TINYDRM_MI0283QT
+ 	tristate "DRM support for MI0283QT"
+ 	depends on DRM && SPI
+diff --git a/drivers/gpu/drm/tiny/Makefile b/drivers/gpu/drm/tiny/Makefile
+index 9c27bdb40..2326d48e6 100644
+--- a/drivers/gpu/drm/tiny/Makefile
++++ b/drivers/gpu/drm/tiny/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_TINYDRM_HX8357D)		+= hx8357d.o
+ obj-$(CONFIG_TINYDRM_ILI9225)		+= ili9225.o
+ obj-$(CONFIG_TINYDRM_ILI9341)		+= ili9341.o
+ obj-$(CONFIG_TINYDRM_ILI9486)		+= ili9486.o
++obj-$(CONFIG_TINYDRM_ILI9488)		+= ili9488.o
+ obj-$(CONFIG_TINYDRM_MI0283QT)		+= mi0283qt.o
+ obj-$(CONFIG_TINYDRM_REPAPER)		+= repaper.o
+ obj-$(CONFIG_TINYDRM_ST7586)		+= st7586.o
+diff --git a/drivers/gpu/drm/tiny/ili9488.c b/drivers/gpu/drm/tiny/ili9488.c
+new file mode 100644
+index 000000000..b4bf9e140
+--- /dev/null
++++ b/drivers/gpu/drm/tiny/ili9488.c
+@@ -0,0 +1,239 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * DRM driver for Ilitek ILI9488 panels
++ *
++ * Copyright 2020 Kamlesh Gurudasani <kamlesh.gurudasani@gmail.com>
++ */
++
++#include <linux/backlight.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/property.h>
++#include <linux/spi/spi.h>
++
++#include <video/mipi_display.h>
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_fb_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_mipi_dbi.h>
++#include <drm/drm_modeset_helper.h>
++
++
++#define ILI9488_FRAMCTRL1       0xb1
++#define ILI9488_INVERSIONCTRL   0xb4
++#define ILI9488_DISPLAYCTRL     0xb6
++#define ILI9488_ENTRYMODECTRL   0xb7
++#define ILI9488_LIGHTCTRL7      0xbe
++#define ILI9488_PWCTRL1         0xc0
++#define ILI9488_PWCTRL2         0xc1
++#define ILI9488_VMCTRL1         0xc5
++#define ILI9488_PGAMCTRL        0xe0
++#define ILI9488_NGAMCTRL        0xe1
++#define ILI9488_DGAMCTRL        0xe2
++#define ILI9488_IMGMAGCTRL      0xe9
++#define ILI9488_PUMPRATIOCTRL   0xf7
++#define ILI9488_MADCTL_BGR      BIT(3)
++#define ILI9488_MADCTL_MV       BIT(5)
++#define ILI9488_MADCTL_MX       BIT(6)
++#define ILI9488_MADCTL_MY       BIT(7)
++
++static void walntu_enable(struct drm_simple_display_pipe *pipe,
++			     struct drm_crtc_state *crtc_state,
++			     struct drm_plane_state *plane_state)
++{
++	struct mipi_dbi_dev *dbidev = drm_to_mipi_dbi_dev(pipe->crtc.dev);
++	struct mipi_dbi *dbi = &dbidev->dbi;
++	u8 addr_mode;
++	int ret, idx;
++
++	if (!drm_dev_enter(pipe->crtc.dev, &idx))
++		return;
++
++	DRM_DEBUG_KMS("\n");
++
++	ret = mipi_dbi_poweron_conditional_reset(dbidev);
++	if (ret < 0)
++		goto out_exit;
++	if (ret == 1)
++		goto out_enable;
++
++
++	mipi_dbi_command(dbi, ILI9488_PUMPRATIOCTRL, 0xa9, 0x51, 0x2c, 0x82);
++	mipi_dbi_command(dbi, ILI9488_PWCTRL1, 0x11, 0x09);
++	mipi_dbi_command(dbi, ILI9488_PWCTRL2, 0x41);
++	mipi_dbi_command(dbi, ILI9488_VMCTRL1, 0x00, 0x0a, 0x80);
++	mipi_dbi_command(dbi, ILI9488_FRAMCTRL1, 0xb0, 0x11);
++	mipi_dbi_command(dbi, ILI9488_INVERSIONCTRL, 0x02);
++	mipi_dbi_command(dbi, ILI9488_DISPLAYCTRL, 0x02, 0x42);
++	mipi_dbi_command(dbi, ILI9488_ENTRYMODECTRL, 0xC6);
++
++	mipi_dbi_command(dbi, ILI9488_LIGHTCTRL7, 0x00, 0x04);
++	mipi_dbi_command(dbi, ILI9488_IMGMAGCTRL, 0x00);
++	mipi_dbi_command(dbi, MIPI_DCS_SET_PIXEL_FORMAT, 0x55);
++	mipi_dbi_command(dbi, ILI9488_PGAMCTRL, 0x00, 0x07, 0x10, 0x09, 0x17,
++			 0x0b, 0x41, 0x89, 0x4b, 0x0a, 0x0c, 0x0e, 0x18, 0x1b,
++			 0x0f);
++	mipi_dbi_command(dbi, ILI9488_NGAMCTRL, 0x00, 0x17, 0x1a, 0x04, 0x0e,
++			 0x06, 0x2f, 0x45, 0x43, 0x02, 0x0a, 0x09, 0x32, 0x36,
++			 0x0f);
++
++	mipi_dbi_command(dbi, MIPI_DCS_EXIT_SLEEP_MODE);
++	msleep(120);
++	mipi_dbi_command(dbi, MIPI_DCS_SET_DISPLAY_ON);
++	msleep(100);
++
++ out_enable:
++	switch (dbidev->rotation) {
++	case 90:
++		addr_mode = ILI9488_MADCTL_MY;
++		break;
++	case 180:
++		addr_mode = ILI9488_MADCTL_MV;
++		break;
++	case 270:
++		addr_mode = ILI9488_MADCTL_MX;
++		break;
++	default:
++		addr_mode = ILI9488_MADCTL_MV | ILI9488_MADCTL_MY |
++			ILI9488_MADCTL_MX;
++		break;
++	}
++	addr_mode |= ILI9488_MADCTL_BGR;
++	mipi_dbi_command(dbi, MIPI_DCS_SET_ADDRESS_MODE, addr_mode);
++	mipi_dbi_enable_flush(dbidev, crtc_state, plane_state);
++ out_exit:
++	drm_dev_exit(idx);
++}
++
++static const struct drm_simple_display_pipe_funcs walntu_pipe_funcs = {
++	.enable = walntu_enable,
++	.disable = mipi_dbi_pipe_disable,
++	.update = mipi_dbi_pipe_update,
++	.prepare_fb = drm_gem_fb_simple_display_pipe_prepare_fb,
++};
++
++static const struct drm_display_mode walntu_mode = {
++	DRM_SIMPLE_MODE(480, 320, 73, 49),
++};
++
++DEFINE_DRM_GEM_CMA_FOPS(ILI9488_fops);
++
++static struct drm_driver ILI9488_driver = {
++	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops			= &ILI9488_fops,
++	DRM_GEM_CMA_DRIVER_OPS_VMAP,
++	.debugfs_init		= mipi_dbi_debugfs_init,
++	.name			= "ILI9488",
++	.desc			= "Ilitek ILI9488",
++	.date			= "20200118",
++	.major			= 1,
++	.minor			= 0,
++};
++
++static const struct of_device_id ILI9488_of_match[] = {
++	{ .compatible = "walntu,rpi-lcd-35" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, ILI9488_of_match);
++
++static const struct spi_device_id ILI9488_id[] = {
++	{ "ILI9488", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, ILI9488_id);
++
++static int ILI9488_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct mipi_dbi_dev *dbidev;
++	struct drm_device *drm;
++	struct mipi_dbi *dbi;
++	struct gpio_desc *dc;
++	u32 rotation = 0;
++	int ret;
++
++	dbidev = devm_drm_dev_alloc(dev, &ILI9488_driver,
++				    struct mipi_dbi_dev, drm);
++	if (IS_ERR(dbidev))
++		return PTR_ERR(dbidev);
++
++	dbi = &dbidev->dbi;
++	drm = &dbidev->drm;
++
++	dbi->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(dbi->reset)) {
++		DRM_DEV_ERROR(dev, "Failed to get gpio 'reset'\n");
++		return PTR_ERR(dbi->reset);
++	}
++
++	dc = devm_gpiod_get(dev, "dc", GPIOD_OUT_LOW);
++	if (IS_ERR(dc)) {
++		DRM_DEV_ERROR(dev, "Failed to get gpio 'dc'\n");
++		return PTR_ERR(dc);
++	}
++
++	dbidev->backlight = devm_of_find_backlight(dev);
++	if (IS_ERR(dbidev->backlight))
++		return PTR_ERR(dbidev->backlight);
++
++	device_property_read_u32(dev, "rotation", &rotation);
++
++	ret = mipi_dbi_spi_init(spi, dbi, dc);
++	if (ret)
++		return ret;
++
++	dbi->read_commands = NULL;
++
++	ret = mipi_dbi_dev_init(dbidev, &walntu_pipe_funcs,
++				&walntu_mode, rotation);
++	if (ret)
++		return ret;
++
++	drm_mode_config_reset(drm);
++
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		return ret;
++
++	spi_set_drvdata(spi, drm);
++
++	drm_fbdev_generic_setup(drm, 0);
++
++	return 0;
++}
++
++static int ILI9488_remove(struct spi_device *spi)
++{
++	struct drm_device *drm = spi_get_drvdata(spi);
++
++	drm_dev_unplug(drm);
++	drm_atomic_helper_shutdown(drm);
++
++	return 0;
++}
++
++static void ILI9488_shutdown(struct spi_device *spi)
++{
++	drm_atomic_helper_shutdown(spi_get_drvdata(spi));
++}
++
++static struct spi_driver ILI9488_spi_driver = {
++	.driver = {
++		.name = "ILI9488",
++		.of_match_table = ILI9488_of_match,
++	},
++	.id_table = ILI9488_id,
++	.probe = ILI9488_probe,
++	.remove = ILI9488_remove,
++	.shutdown = ILI9488_shutdown,
++};
++module_spi_driver(ILI9488_spi_driver);
++
++MODULE_DESCRIPTION("Ilitek ILI9488 DRM driver");
++MODULE_AUTHOR("Kamlesh Gurudasani <kamlesh.gurudasani@gmail.com>");
++MODULE_LICENSE("GPL");
+-- 
+2.34.1
+
