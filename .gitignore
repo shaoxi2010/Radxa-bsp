@@ -1,4 +1,4 @@
-*.deb
+/*.deb
 .src/
 .root/
 .vscode*
